@@ -52,6 +52,7 @@ long long memtoll(const char *p, int *err);
 uint32_t digits10(uint64_t v);
 uint32_t sdigits10(int64_t v);
 int ll2string(char *s, size_t len, long long value);
+unsigned ull2string(char *dst, size_t dstlen, uint64_t value);
 int string2ll(const char *s, size_t slen, long long *value);
 int string2ull(const char *s, unsigned long long *value);
 int string2l(const char *s, size_t slen, long *value);
@@ -62,6 +63,20 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode);
 sds getAbsolutePath(char *filename);
 unsigned long getTimeZone(void);
 int pathIsBaseName(char *path);
+
+/* Wrappers around strtoull/strtoll that are safer and easier to
+ * use.  For tests and assumptions, see internal_tests.c.
+ *
+ * str   a NULL-terminated base decimal 10 unsigned integer
+ * out   out parameter, if conversion succeeded
+ *
+ * returns true if conversion succeeded.
+ */
+int safe_strtoull(const char *str, uint64_t *out);
+int safe_strtoll(const char *str, int64_t *out);
+int safe_strtoul(const char *str, uint32_t *out);
+int safe_strtol(const char *str, int32_t *out);
+
 
 #ifdef REDIS_TEST
 int utilTest(int argc, char **argv);

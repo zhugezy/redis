@@ -34,6 +34,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+
 /*-----------------------------------------------------------------------------
  * Config file name-value maps.
  *----------------------------------------------------------------------------*/
@@ -322,12 +323,12 @@ void loadServerConfigFromString(char *config) {
         int match = 0;
         for (standardConfig *config = configs; config->name != NULL; config++) {
             if ((!strcasecmp(argv[0],config->name) ||
-                (config->alias && !strcasecmp(argv[0],config->alias))))
-            {
+                (config->alias && !strcasecmp(argv[0],config->alias)))) {
                 if (argc != 2) {
                     err = "wrong number of arguments";
                     goto loaderr;
                 }
+                
                 if (!config->interface.set(config->data, argv[1], 0, &err)) {
                     goto loaderr;
                 }
@@ -504,6 +505,9 @@ void loadServerConfigFromString(char *config) {
                 err = sentinelHandleConfiguration(argv+1,argc-1);
                 if (err) goto loaderr;
             }
+        } else if (!strcasecmp(argv[0], "protocol") && argc == 2) {
+            //directive: protocol memcached
+            server.protocol = (!strcasecmp(argv[1], "memcached") || !strcasecmp(argv[1], "memcache")) ? MEMCACHED : REDIS;
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }

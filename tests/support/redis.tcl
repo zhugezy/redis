@@ -214,8 +214,22 @@ proc ::redis::redis_read_line fd {
     string trim [gets $fd]
 }
 
+proc ::redis::redis_read_memcache_binary_reply {fd} {
+    # Magic has been read, so it will start from Opcode(byte 1).
+    set res ""
+    append res [read $fd 7]
+    # Read Total body length (byte 8~11).
+    set str_bodylength [read $fd 4]
+    scan $str_bodylength {%c%c%c%c} a b c d
+    set bodylength [expr $a<<24|$b<<16|$c<<8|$d]
+    append res $str_bodylength
+    append res [read $fd [expr 12+$bodylength]]
+    return $res
+}
+
 proc ::redis::redis_read_reply {id fd} {
     set type [read $fd 1]
+    set res ""
     switch -exact -- $type {
         : -
         + {redis_read_line $fd}
@@ -223,7 +237,38 @@ proc ::redis::redis_read_reply {id fd} {
         $ {redis_bulk_read $fd}
         * {redis_multi_bulk_read $id $fd}
         default {
-            if {$type eq {}} {
+            append res $type
+            scan $type {%c} typenum
+            # check if the reply is memcached ascii(A-Za-z0-9):
+            if {($typenum >= 0x30 && $typenum <= 0x39) || ($typenum >= 0x41 && $typenum <= 0x5a) || ($typenum >= 0x61 && $typenum <= 0x7a)} {
+                # the first character is A-Za-z0-9:
+                if {$type == "V"} {
+                    # guess it's "VALUE", need further checks:
+                    set type [read $fd 5]
+                    append res $type
+                    if {$type == "ALUE "} {
+                        # VALUE: We need to read lines until we meet with "END".
+                        while {1} {
+                            set newline [redis_read_line $fd]
+                            append res $newline
+                            append res "\r\n"
+                            if {$newline == "END"} {
+                                break
+                            }
+                        }
+                    } else {
+                        append res [redis_read_line $fd]
+                    }
+                } else {
+                    append res [redis_read_line $fd]
+                }
+                return [string trim $res]
+            } elseif {$typenum == 0x81} {
+                # the reply is memcached binary:
+                append res [redis_read_memcache_binary_reply $fd]
+                return $res
+            } elseif {$type eq {}} {
+                # ERROR
                 set ::redis::fd($id) {}
                 return -code error "I/O error reading reply"
             }

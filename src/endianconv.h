@@ -52,6 +52,8 @@ uint64_t intrev64(uint64_t v);
 #define intrev16ifbe(v) (v)
 #define intrev32ifbe(v) (v)
 #define intrev64ifbe(v) (v)
+#define ntohll(v) intrev64(v)
+#define htonll(v) intrev64(v)
 #else
 #define memrev16ifbe(p) memrev16(p)
 #define memrev32ifbe(p) memrev32(p)

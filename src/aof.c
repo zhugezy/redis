@@ -612,8 +612,14 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
         int i;
         robj *exarg = NULL, *pxarg = NULL;
         for (i = 3; i < argc; i ++) {
-            if (!strcasecmp(argv[i]->ptr, "ex")) exarg = argv[i+1];
-            if (!strcasecmp(argv[i]->ptr, "px")) pxarg = argv[i+1];
+            if (server.protocol == REDIS) {
+                if (!strcasecmp(argv[i]->ptr, "ex")) exarg = argv[i+1];
+                if (!strcasecmp(argv[i]->ptr, "px")) pxarg = argv[i+1];
+            } else { /* server.protocol == MEMCACHED */
+                if (argv[i]->encoding == OBJ_ENCODING_RAW && !strcasecmp(argv[i]->ptr, "ex")) exarg = argv[i+1];
+                if (argv[i]->encoding == OBJ_ENCODING_RAW && !strcasecmp(argv[i]->ptr, "px")) pxarg = argv[i+1];
+            }
+            
         }
         serverAssert(!(exarg && pxarg));
 

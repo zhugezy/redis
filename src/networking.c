@@ -34,7 +34,7 @@
 #include <math.h>
 #include <ctype.h>
 
-static void setProtocolError(const char *errstr, client *c);
+void setProtocolError(const char *errstr, client *c);
 int postponeClientRead(client *c);
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 
@@ -1558,7 +1558,7 @@ int processInlineBuffer(client *c) {
  * and set the client as CLIENT_CLOSE_AFTER_REPLY and
  * CLIENT_PROTOCOL_ERROR. */
 #define PROTO_DUMP_LEN 128
-static void setProtocolError(const char *errstr, client *c) {
+void setProtocolError(const char *errstr, client *c) {
     if (server.verbosity <= LL_VERBOSE || c->flags & CLIENT_MASTER) {
         sds client = catClientInfoString(sdsempty(),c);
 
@@ -1771,6 +1771,30 @@ void commandProcessed(client *c) {
     }
 }
 
+/* Because we will porcess redis and memcached protocol,
+ * so we create two functions.
+ */
+int processRedisProtocolBuffer(client *c) {
+    /* Determine request type when unknown. */
+    int ret = C_ERR;
+    if (!c->reqtype) {
+        if (c->querybuf[c->qb_pos] == '*') {
+            c->reqtype = PROTO_REQ_MULTIBULK;
+        } else {
+            c->reqtype = PROTO_REQ_INLINE;
+        }
+    }
+
+    if (c->reqtype == PROTO_REQ_INLINE) {
+        ret = processInlineBuffer(c);
+    } else if (c->reqtype == PROTO_REQ_MULTIBULK) {
+        ret = processMultibulkBuffer(c);
+    } else {
+        serverPanic("Unknown request type");
+    }
+    return ret;
+}
+
 /* This function calls processCommand(), but also performs a few sub tasks
  * for the client that are useful in that context:
  *
@@ -1824,31 +1848,12 @@ void processInputBuffer(client *c) {
         if (c->flags & (CLIENT_CLOSE_AFTER_REPLY|CLIENT_CLOSE_ASAP)) break;
 
         /* Determine request type when unknown. */
-        if (!c->reqtype) {
-            if (c->querybuf[c->qb_pos] == '*') {
-                c->reqtype = PROTO_REQ_MULTIBULK;
-            } else {
-                c->reqtype = PROTO_REQ_INLINE;
-            }
-        }
-
-        if (c->reqtype == PROTO_REQ_INLINE) {
-            if (processInlineBuffer(c) != C_OK) break;
-            /* If the Gopher mode and we got zero or one argument, process
-             * the request in Gopher mode. */
-            if (server.gopher_enabled &&
-                ((c->argc == 1 && ((char*)(c->argv[0]->ptr))[0] == '/') ||
-                  c->argc == 0))
-            {
-                processGopherRequest(c);
-                resetClient(c);
-                c->flags |= CLIENT_CLOSE_AFTER_REPLY;
-                break;
-            }
-        } else if (c->reqtype == PROTO_REQ_MULTIBULK) {
-            if (processMultibulkBuffer(c) != C_OK) break;
-        } else {
-            serverPanic("Unknown request type");
+        int ret = server.protocolParseProcess(c);
+        if (ret == C_ERR) {
+            break;
+        } else if (ret == C_AGAIN) {
+            resetClient(c);
+            continue;
         }
 
         /* Multibulk processing could see a <= 0 length. */
@@ -1896,7 +1901,7 @@ void readQueryFromClient(connection *conn) {
      * at the risk of requiring more read(2) calls. This way the function
      * processMultiBulkBuffer() can avoid copying buffers to create the
      * Redis Object representing the argument. */
-    if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1
+    if ((c->reqtype == PROTO_REQ_MULTIBULK || c->reqtype == PROTO_REQ_ASCII) && c->multibulklen && c->bulklen != -1
         && c->bulklen >= PROTO_MBULK_BIG_ARG)
     {
         ssize_t remaining = (size_t)(c->bulklen+2)-sdslen(c->querybuf);

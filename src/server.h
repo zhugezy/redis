@@ -82,11 +82,12 @@ typedef long long ustime_t; /* microsecond time type. */
 #include "sha1.h"
 #include "endianconv.h"
 #include "crc64.h"
+#include "memcached_binary_define.h"
 
 /* Error codes */
 #define C_OK                    0
 #define C_ERR                   -1
-
+#define C_AGAIN                 -2
 /* Static server configuration */
 #define CONFIG_DEFAULT_HZ        10             /* Time interrupt calls/sec. */
 #define CONFIG_MIN_HZ            1
@@ -171,6 +172,7 @@ typedef long long ustime_t; /* microsecond time type. */
 #define CMD_ASKING (1ULL<<13)          /* "cluster-asking" flag */
 #define CMD_FAST (1ULL<<14)            /* "fast" flag */
 #define CMD_NO_AUTH (1ULL<<15)         /* "no-auth" flag */
+#define CMD_BINARY (1ULL<<39)
 
 /* Command flags used by the module system. */
 #define CMD_MODULE_GETKEYS (1ULL<<16)  /* Use the modules getkeys interface. */
@@ -198,6 +200,8 @@ typedef long long ustime_t; /* microsecond time type. */
 #define CMD_CATEGORY_CONNECTION (1ULL<<36)
 #define CMD_CATEGORY_TRANSACTION (1ULL<<37)
 #define CMD_CATEGORY_SCRIPTING (1ULL<<38)
+
+
 
 /* AOF states */
 #define AOF_OFF 0             /* AOF is off */
@@ -257,6 +261,10 @@ typedef long long ustime_t; /* microsecond time type. */
 #define CLIENT_IN_TO_TABLE (1ULL<<38) /* This client is in the timeout table. */
 #define CLIENT_PROTOCOL_ERROR (1ULL<<39) /* Protocol error chatting with it. */
 
+
+#define CLIENT_NO_REPLY (1UL<<40) /* Client need no response */
+
+
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
 #define BLOCKED_NONE 0    /* Not blocked, no CLIENT_BLOCKED flag set. */
@@ -270,6 +278,8 @@ typedef long long ustime_t; /* microsecond time type. */
 /* Client request types */
 #define PROTO_REQ_INLINE 1
 #define PROTO_REQ_MULTIBULK 2
+#define PROTO_REQ_ASCII 3
+#define PROTO_REQ_BINARY 4
 
 /* Client classes for client limits, currently used only for
  * the max-client-output-buffer limit implementation. */
@@ -716,6 +726,45 @@ typedef struct readyList {
     robj *key;
 } readyList;
 
+/* a redis instance runs in one of the follow modes:
+ * redis mode, or memcached mode; default is the redis mode */
+typedef enum runProtocol {
+    REDIS = 0x0,
+    MEMCACHED
+} runProtocol;
+
+#define PROTOCOL_REDIS_STR "REDIS"
+#define PROTOCOL_MEMCACHED_STR "MEMCACHED"
+#define USER_PASSWORD_FREE 0x1
+
+#define MEMCACHED_VERSION "1.4.33"
+
+/* reply wrapper
+ */
+struct client;
+typedef void (*replyWrapper)(struct client *c, const char *err_str);
+struct helpWrapper {
+    replyWrapper replyQuit;
+    replyWrapper replyDisableRWErr;
+    replyWrapper replyNoAuthErr;
+    replyWrapper replyOomErr;
+    replyWrapper replyWritingAofErr;
+    replyWrapper replyOpenningAofErr;
+    replyWrapper replyBgsaveErr;
+    replyWrapper replyNoreplicasErr;
+    replyWrapper replyRoslaveErr;
+    replyWrapper replyReadOnlyErr;
+    replyWrapper replyMasterdownErr;
+    replyWrapper replyLoadingErr;
+    replyWrapper replyUnknownCommandErr;
+};
+struct redisServer;
+void initHelpWrappers(struct redisServer *server, struct helpWrapper *wrappers);
+/*
+ * protocol parse handler
+ */
+typedef int protocolParseProc(struct client *c);
+
 /* This structure represents a Redis user. This is useful for ACLs, the
  * user is associated to the connection after the connection is authenticated.
  * If there is no associated user, the connection uses the default user. */
@@ -787,6 +836,7 @@ typedef struct client {
     int reqtype;            /* Request protocol type: PROTO_REQ_* */
     int multibulklen;       /* Number of multi bulk arguments left to read. */
     long bulklen;           /* Length of bulk argument in multi bulk request. */
+    memcachedBinaryRequestHeader binary_header; /* this is where the memcached binary header goes*/
     list *reply;            /* List of reply objects to send to the client. */
     unsigned long long reply_bytes; /* Tot bytes of objects in reply list. */
     size_t sentlen;         /* Amount of bytes already sent in the current
@@ -877,6 +927,18 @@ struct sharedObjectsStruct {
     *mbulkhdr[OBJ_SHARED_BULKHDR_LEN], /* "*<value>\r\n" */
     *bulkhdr[OBJ_SHARED_BULKHDR_LEN];  /* "$<value>\r\n" */
     sds minstring, maxstring;
+};
+
+/*memcached text shared objects*/
+struct sharedMemcachedObjectsStruct {
+    robj *crlf, *ok, *err, *noautherr, *norw, *emptybulk,*oomerr,
+         *interr, *bgsaveerr, *noreplicaserr, *roslaveerr, *roerr,
+         *masterdownerr, *loadingerr, *version, *vercmd, *quitcmd,
+         *noopcmd, *badfmt, *stored, *ex, *end, *invalidexp, *touched,
+         *not_found, *exists, *not_stored, *invalid_numeric, *deleted,
+         *invalid_delta, *px, *setcmd, *flushallcmd, *delcmd, *expirecmd,
+         *persistcmd, *invalid_pw_or_uname, *sasl_list_cmd, *too_large,
+         *not_in_white_list_err;
 };
 
 /* ZSETs use a specialized version of Skiplists */
@@ -1041,6 +1103,8 @@ struct redisServer {
     redisDb *db;
     dict *commands;             /* Command table */
     dict *orig_commands;        /* Command table before command renaming. */
+    dict *memcached_commands;   /* memcached command table*/
+    uint32_t max_memcached_read_request_length; /* the max read size of key + value */
     aeEventLoop *el;
     _Atomic unsigned int lruclock; /* Clock for LRU eviction */
     int shutdown_asap;          /* SHUTDOWN needed ASAP */
@@ -1307,6 +1371,11 @@ struct redisServer {
     int slave_priority;             /* Reported in INFO and used by Sentinel. */
     int slave_announce_port;        /* Give the master this listening port. */
     char *slave_announce_ip;        /* Give the master this ip address. */
+
+    runProtocol protocol; /* instance run mode */
+    const char *protocol_str;   /* run mode str: redis or memcached */
+    protocolParseProc *protocolParseProcess;
+
     /* The following two fields is where we store master PSYNC replid/offset
      * while the PSYNC is in progress. At the end we'll copy the fields into
      * the server->master client structure. */
@@ -1469,6 +1538,20 @@ struct redisCommand {
                    bit set in the bitmap of allowed commands. */
 };
 
+/*just deal 18 memcached commands*/
+#define MEMCACHED_TEXT_REQUEST_NUM 16
+#define MEMCACHED_BINARY_REQUEST_NUM 35
+#define MEMCACHED_MAX_OPCODE 0x22
+/*define memcached text request parser help function*/
+typedef int textParserHelperProc(struct client *c, const size_t len, void *tokens, const size_t ntokens, const int hint, const int pos);
+struct memcachedCommand {
+    struct redisCommand command;
+    textParserHelperProc *proc;
+    uint8_t opcode;
+    uint8_t has_cas;
+};
+
+
 struct redisFunctionSym {
     char *name;
     unsigned long pointer;
@@ -1534,6 +1617,7 @@ typedef struct {
 
 extern struct redisServer server;
 extern struct sharedObjectsStruct shared;
+extern struct sharedMemcachedObjectsStruct memcached_shared;
 extern dictType objectKeyPointerValueDictType;
 extern dictType objectKeyHeapPointerValueDictType;
 extern dictType setDictType;
@@ -1607,6 +1691,9 @@ void setDeferredSetLen(client *c, void *node, long length);
 void setDeferredAttributeLen(client *c, void *node, long length);
 void setDeferredPushLen(client *c, void *node, long length);
 void processInputBuffer(client *c);
+int  processRedisProtocolBuffer(client *c);
+int  processMemcachedProtocolBuffer(client *c);
+int  processMemcachedProtocolBuffer(client *c);
 void processGopherRequest(client *c);
 void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -1959,6 +2046,8 @@ void setupSignalHandlers(void);
 struct redisCommand *lookupCommand(sds name);
 struct redisCommand *lookupCommandByCString(char *s);
 struct redisCommand *lookupCommandOrOriginal(sds name);
+struct memcachedCommand *lookupMemcachedCommand(sds name);
+struct memcachedCommand *lookupMemcachedCommandByCString(char *name);
 void call(client *c, int flags);
 void propagate(struct redisCommand *cmd, int dbid, robj **argv, int argc, int flags);
 void alsoPropagate(struct redisCommand *cmd, int dbid, robj **argv, int argc, int target);

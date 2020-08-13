@@ -60,6 +60,16 @@
 
 struct sharedObjectsStruct shared;
 
+/*declare the memcachedCommandTable*/
+extern struct memcachedCommand memcachedCommandTable[MEMCACHED_TEXT_REQUEST_NUM + MEMCACHED_BINARY_REQUEST_NUM];
+extern void createMemcachedSharedObjects(void);
+extern void saslListMechsMemcachedCommand(struct client *c);
+extern void saslAuthMemcachedCommand(struct client *c);
+extern void saslStepMemcachedCommand(struct client *c);
+extern void versionMemcachedCommand(struct client *c);
+extern void authMemcachedCommand(struct client *c);
+struct helpWrapper helpWrappers;
+
 /* Global vars that are actually used as constants. The following double
  * values are used for double on-disk serialization, and are initialized
  * at runtime to avoid strange compiler optimizations. */
@@ -1178,6 +1188,15 @@ int dictSdsKeyCaseCompare(void *privdata, const void *key1,
     return strcasecmp(key1, key2) == 0;
 }
 
+/* A case sensitive version used for the memcached command lookup table. */
+int dictSdsKeyCaseSensitiveCompare(void *privdata, const void *key1,
+        const void *key2)
+{
+    DICT_NOTUSED(privdata);
+
+    return strcmp(key1, key2) == 0;
+}
+
 void dictObjectDestructor(void *privdata, void *val)
 {
     DICT_NOTUSED(privdata);
@@ -1211,6 +1230,10 @@ uint64_t dictSdsHash(const void *key) {
 
 uint64_t dictSdsCaseHash(const void *key) {
     return dictGenCaseHashFunction((unsigned char*)key, sdslen((char*)key));
+}
+
+uint64_t dictSdsCaseSensitiveHash(const void *key) {
+    return dictGenHashFunction((unsigned char*)key, sdslen((char*)key));
 }
 
 int dictEncObjKeyCompare(void *privdata, const void *key1,
@@ -1339,6 +1362,19 @@ dictType commandTableDictType = {
     dictSdsDestructor,          /* key destructor */
     NULL                        /* val destructor */
 };
+
+/* Memcached command table. sds string -> command struct pointer. 
+ * because memcached ascii command is case sensitive, so using sensitive
+ * hash and compare functions*/
+dictType memcachedCommandTableDictType = {
+    dictSdsCaseSensitiveHash,           /* hash function */
+    NULL,                      /* key dup */
+    NULL,                      /* val dup */
+    dictSdsKeyCaseSensitiveCompare,     /* key compare */
+    dictSdsDestructor,         /* key destructor */
+    NULL                       /* val destructor */
+};
+
 
 /* Hash type hash table (note that small hashes are represented with ziplists) */
 dictType hashDictType = {
@@ -2376,6 +2412,10 @@ void initServerConfig(void) {
     server.migrate_cached_sockets = dictCreate(&migrateCacheDictType,NULL);
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.loading_process_events_interval_bytes = (1024*1024*2);
+    server.protocol = REDIS;
+    server.protocol_str = PROTOCOL_REDIS_STR;
+    server.protocolParseProcess = processRedisProtocolBuffer; 
+    server.max_memcached_read_request_length = MAX_MEMCACHED_READ_REQUEST_LENGTH_DEFAULT;
 
     server.lruclock = getLRUClock();
     resetServerSaveParams();
@@ -2449,7 +2489,7 @@ void initServerConfig(void) {
      * script to the slave / AOF. This is the new way starting from
      * Redis 5. However it is possible to revert it via redis.conf. */
     server.lua_always_replicate_commands = 1;
-
+    server.protocolParseProcess = processRedisProtocolBuffer;
     initConfigValues();
 }
 
@@ -2739,6 +2779,10 @@ void resetServerStats(void) {
     server.aof_delayed_fsync = 0;
 }
 
+void initServerHelperWrappers() {
+    initHelpWrappers(&server, &helpWrappers);
+}
+
 void initServer(void) {
     int j;
 
@@ -2789,6 +2833,20 @@ void initServer(void) {
         exit(1);
     }
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
+    server.memcached_commands = NULL;
+
+    initServerHelperWrappers();
+    if (server.protocol == MEMCACHED) {
+        /* memcached ascii command is case sensitive */
+        server.memcached_commands = dictCreate(&memcachedCommandTableDictType,NULL);
+        server.protocolParseProcess = processMemcachedProtocolBuffer;
+        /* Because redis needs initialize command dict before loading config file, but 
+         * only we have loaded config file  we can know 
+         * the instance is memcached or not, so I add memcached dict, and initialize it here; */
+        populateCommandTable();
+        createMemcachedSharedObjects();
+        server.protocol_str = PROTOCOL_MEMCACHED_STR;
+    }
 
     /* Open the TCP listening socket for the user commands. */
     if (server.port != 0 &&
@@ -2959,6 +3017,8 @@ void InitServerLast() {
     server.initial_memory_usage = zmalloc_used_memory();
 }
 
+
+
 /* Parse the flags string description 'strflags' and set them to the
  * command 'c'. If the flags are all valid C_OK is returned, otherwise
  * C_ERR is returned (yet the recognized flags are set in the command). */
@@ -3002,6 +3062,8 @@ int populateCommandTableParseFlags(struct redisCommand *c, char *strflags) {
             c->flags |= CMD_FAST | CMD_CATEGORY_FAST;
         } else if (!strcasecmp(flag,"no-auth")) {
             c->flags |= CMD_NO_AUTH;
+        } else if (!strcasecmp(flag,"binary")) {
+            c->flags |= CMD_BINARY;
         } else {
             /* Parse ACL categories here if the flag name starts with @. */
             uint64_t catflag;
@@ -3024,24 +3086,51 @@ int populateCommandTableParseFlags(struct redisCommand *c, char *strflags) {
 
 /* Populates the Redis Command Table starting from the hard coded list
  * we have on top of redis.c file. */
+#define REDIS_COMMAND_STRUCT_SIZE sizeof(struct redisCommand)
+#define REDIS_COMMAND_TABLE_SIZE sizeof(redisCommandTable)
+#define REDIS_AUX_THREAD_COMMAND_TABLE_SIZE sizeof(redisAuxThreadCommandTable)
+#define MEMCACHED_COMMAND_STRUCT_SIZE sizeof(struct memcachedCommand)
+#define MEMCACHED_COMMAND_TABLE_SIZE sizeof(memcachedCommandTable)
 void populateCommandTable(void) {
     int j;
-    int numcommands = sizeof(redisCommandTable)/sizeof(struct redisCommand);
+    char *commandTable = NULL;
+    int numcommands;
+    size_t cmss = 1;
+    if (server.protocol == REDIS) {
+        cmss = sizeof(struct redisCommand);
+    } else {
+        cmss = sizeof(struct memcachedCommand);
+    }
 
+    if (server.protocol == REDIS) {
+        numcommands = sizeof(redisCommandTable) / cmss;
+        commandTable = (char *)redisCommandTable;
+    } else {
+        numcommands = sizeof(memcachedCommandTable) / cmss;
+        commandTable = (char *)memcachedCommandTable;
+    }
     for (j = 0; j < numcommands; j++) {
-        struct redisCommand *c = redisCommandTable+j;
+        struct redisCommand *c = (struct redisCommand *)(commandTable+j*cmss);
         int retval1, retval2;
-
         /* Translate the command string flags description into an actual
          * set of flags. */
         if (populateCommandTableParseFlags(c,c->sflags) == C_ERR)
             serverPanic("Unsupported command flag");
 
         c->id = ACLGetCommandID(c->name); /* Assign the ID used for ACL. */
-        retval1 = dictAdd(server.commands, sdsnew(c->name), c);
+
+        if (server.protocol == REDIS) {
+            retval1 = dictAdd(server.commands, sdsnew(c->name), c);
+        } else {
+            if (!(c->flags & CMD_BINARY)) {
+                retval1 = dictAdd(server.memcached_commands, sdsnew(c->name), c);
+            } else {
+                retval1 = DICT_OK;
+            }
+        }
         /* Populate an additional dictionary that will be unaffected
          * by rename-command statements in redis.conf. */
-        retval2 = dictAdd(server.orig_commands, sdsnew(c->name), c);
+        retval2 = (server.protocol == REDIS) ? dictAdd(server.orig_commands, sdsnew(c->name), c) : DICT_OK;
         serverAssert(retval1 == DICT_OK && retval2 == DICT_OK);
     }
 }
@@ -3112,6 +3201,20 @@ struct redisCommand *lookupCommandByCString(char *s) {
     sdsfree(name);
     return cmd;
 }
+
+struct memcachedCommand *lookupMemcachedCommandByCString(char *s) {
+    struct memcachedCommand *cmd;
+    sds name = sdsnew(s);
+
+    cmd = dictFetchValue(server.memcached_commands, name);
+    sdsfree(name);
+    return cmd;
+}
+
+struct memcachedCommand *lookupMemcachedCommand(sds name) {
+    return dictFetchValue(server.memcached_commands, name);
+}
+
 
 /* Lookup the command in the current table, if not found also check in
  * the original table containing the original command names unaffected by
@@ -3423,10 +3526,23 @@ int processCommand(client *c) {
         return C_ERR;
     }
 
-    /* Now lookup the command and check ASAP about trivial error conditions
-     * such as wrong arity, bad command name and so forth. */
-    c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+    if (server.protocol == REDIS) {
+        /* Now lookup the command and check ASAP about trivial error conditions
+         * such as wrong arity, bad command name and so forth. 
+         */
+        c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+    } else {
+         /* When running in memcached mode and the reqtype is REDIS_REQ_INLINE or MEMCACHED_REQ_ASCII or MEMCACHED_REQ_BINARY, 
+          * the cmd and lastcmd are already assigned, except reqtype is REDIS_REQ_MULTIBULK, so check it here
+          */
+        if (!c->cmd) {
+            c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+        }
+    }
+
     if (!c->cmd) {
+        /* Unknown memcached command should never run here,
+         * but check for safty as well; */
         flagTransaction(c);
         sds args = sdsempty();
         int i;
@@ -3455,6 +3571,16 @@ int processCommand(client *c) {
         if (!(c->cmd->flags & CMD_NO_AUTH)) {
             flagTransaction(c);
             addReply(c,shared.noautherr);
+            return C_OK;
+        }
+    }
+
+    if (server.protocol == MEMCACHED) {
+        /* Running mode is memcached, but use redis protocol request */
+        if (!(c->flags & CLIENT_MASTER) && 
+            (c->reqtype == PROTO_REQ_INLINE || c->reqtype == PROTO_REQ_MULTIBULK) &&
+            (c->cmd->flags & CMD_WRITE)) {
+            addReplyError(c, "operation not permitted, invalid request.");
             return C_OK;
         }
     }
@@ -4531,6 +4657,19 @@ sds genRedisInfoString(const char *section) {
                 (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
         }
         dictReleaseIterator(di);
+
+        int numcommands = MEMCACHED_COMMAND_TABLE_SIZE / MEMCACHED_COMMAND_STRUCT_SIZE;;
+        for (j = 0; j < numcommands; j++) {
+            struct redisCommand *c = (struct redisCommand *)(memcachedCommandTable+j);
+
+            if (c->calls == 0) continue;
+            /* for ascii command, whose opcode is not equal PROTOCOL_BINARY_CMD_FAKE, its statistics data is already added to its binary command */ 
+            if (j < MEMCACHED_TEXT_REQUEST_NUM && memcachedCommandTable[j].opcode != MEMCACHED_BINARY_CMD_FAKE) continue;
+            info = sdscatprintf(info,
+                "cmdstat_mem_%s:calls=%lld,usec=%lld,usec_per_call=%.2f\r\n",
+                c->name, c->calls, c->microseconds,
+                (c->calls == 0) ? 0 : ((float)c->microseconds/c->calls));
+        }
     }
 
     /* Cluster */
@@ -5132,7 +5271,6 @@ int main(int argc, char **argv) {
     redisSetProcTitle(argv[0]);
     redisAsciiArt();
     checkTcpBacklogSettings();
-
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */
         serverLog(LL_WARNING,"Server initialized");
